@@ -1,9 +1,13 @@
 import sys
+from pathlib import Path
+
+# Add Spark-TTS to path (relative to project root)
+_project_root = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_project_root / "Spark-TTS"))
+
 import torch
 import numpy as np
 import torchaudio.transforms as T
-
-sys.path.append("Spark-TTS")
 
 from sparktts.models.audio_tokenizer import BiCodecTokenizer
 from sparktts.utils.audio import audio_volume_normalize
@@ -18,11 +22,22 @@ class AudioTokenizer:
         self.config = self.tokenizer.config
         self.sample_rate = self.config.get("sample_rate", 16000)
 
-    def extract_wav2vec2_features(self, wavs: torch.Tensor) -> torch.Tensor:
-        """Extract wav2vec2 features from audio tensor."""
-        if wavs.shape[0] != 1:
-            raise ValueError(f"Expected batch size 1, but got shape {wavs.shape}")
+    def _preprocess_audio(self, audio_array: np.ndarray, sampling_rate: int) -> np.ndarray:
+        """Resample and normalize audio."""
+        target_sr = self.sample_rate
+        
+        if sampling_rate != target_sr:
+            resampler = T.Resample(orig_freq=sampling_rate, new_freq=target_sr)
+            audio_tensor = torch.from_numpy(audio_array).float()
+            audio_array = resampler(audio_tensor).numpy()
+        
+        if self.config.get("volume_normalize", False):
+            audio_array = audio_volume_normalize(audio_array)
+        
+        return audio_array
 
+    def extract_wav2vec2_features(self, wavs: torch.Tensor) -> torch.Tensor:
+        """Extract wav2vec2 features from single audio tensor."""
         wav_np = wavs.squeeze(0).cpu().numpy()
         processed = self.tokenizer.processor(
             wav_np,
@@ -70,18 +85,7 @@ class AudioTokenizer:
         Returns:
             Tuple of (global_tokens_str, semantic_tokens_str)
         """
-        target_sr = self.sample_rate
-
-        # Resample if needed
-        if sampling_rate != target_sr:
-            resampler = T.Resample(orig_freq=sampling_rate, new_freq=target_sr)
-            audio_tensor = torch.from_numpy(audio_array).float()
-            audio_array = resampler(audio_tensor).numpy()
-
-        # Volume normalize if configured
-        if self.config.get("volume_normalize", False):
-            audio_array = audio_volume_normalize(audio_array)
-
+        audio_array = self._preprocess_audio(audio_array, sampling_rate)
         ref_wav_np = self.tokenizer.get_ref_clip(audio_array)
 
         audio_tensor = torch.from_numpy(audio_array).unsqueeze(0).float().to(self.device)

@@ -15,6 +15,13 @@ dependencies = [
     "trl>=0.22.2",
     "transformers>=4.56.2",
     "unsloth>=2026.1.2",
+    "omegaconf>=2.3.0",
+    "einops>=0.8.1",
+    "einx>=0.3.0",
+    "soxr>=1.0.0",
+    "tqdm>=4.67.1",
+    "sentencepiece>=0.2.1",
+    "tensorboard>=2.20.0",
 ]
 
 [build-system]

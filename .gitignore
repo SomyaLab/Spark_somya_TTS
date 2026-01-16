@@ -7,8 +7,33 @@ wheels/
 *.egg-info
 .DS_Store
 
+.bash_history
+.cursor-server
+.cursor/
+.idea/
+.triton/
+.lightning_studio/
+.vscode-server
+.vscode/
+.wget-hsts
+.windsurf-server
+unsloth*/
+
+
 # Virtual environments
 .venv
 
 # Data
+data/
 dataset/
+.cache/
+
+# External dependencies
+Spark-TTS*/
+extended*
+outputs*/ 
+finetuned_model*/
+
+
+
+

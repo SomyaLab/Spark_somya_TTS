@@ -57,14 +57,28 @@ def run_inference(text: str | None, config: Config):
     return None
 
 
-def run_clone(text: str, ref_audio: str, config: Config):
+def run_clone(text: str | None = None, ref_audio: str | None = None, config: Config = None):
     """Zero-shot voice cloning: generate speech in reference speaker's voice."""
     setup_logging()
-    
-    if not Path(ref_audio).exists():
-        logger.error(f"Reference audio not found: {ref_audio}")
-        return None
-    
+
+    # Default text and reference audio if not provided
+    default_text = "जिसमें जीवन के उच्च आध्यात्मिक मूल्य जीवन की निम्नता और भौतिकता के सम्मुख असमर्थ होते महासमर-बंधन प्रतीत होते हैं और हस्तिनापुर का जीवन महाभारत के युद्ध की दिशा ग्रहण करने लगता है।"
+    default_ref_audio = "data/samples/GNR_hi.wav"
+
+    effective_text = text
+    effective_ref_audio = ref_audio
+
+    if not text or str(text).strip() == "":
+        logger.info(f"No input text provided. Using default:\n{default_text}")
+        effective_text = default_text
+
+    if not ref_audio or not Path(ref_audio).exists():
+        if not ref_audio:
+            logger.info("No reference audio provided. Using default reference audio sample.")
+        else:
+            logger.warning(f"Reference audio not found: {ref_audio}. Using default reference audio sample.")
+        effective_ref_audio = default_ref_audio
+
     if Path(config.lora_dir).exists():
         model, tokenizer = FastModel.from_pretrained(
             model_name=config.lora_dir,
@@ -74,16 +88,16 @@ def run_clone(text: str, ref_audio: str, config: Config):
         )
     else:
         model, tokenizer = load_model(config)
-    
+
     FastModel.for_inference(model)
     audio_tokenizer = AudioTokenizer(config.model_dir, str(config.device))
-    
-    wav = generate_speech_clone(text, ref_audio, model, tokenizer, audio_tokenizer, config)
-    
+
+    wav = generate_speech_clone(effective_text, effective_ref_audio, model, tokenizer, audio_tokenizer, config)
+
     if wav.size > 0:
-        save_audio(wav, "cloned_speech.wav", config.sample_rate)
-        return "cloned_speech.wav"
-    
+        save_audio(wav, "cloned_speech1.wav", config.sample_rate)
+        return "cloned_speech1.wav"
+
     logger.error("Voice cloning failed")
     return None
 
@@ -91,13 +105,13 @@ def run_clone(text: str, ref_audio: str, config: Config):
 def main():
     config = Config()
     args = sys.argv[1:]
-    
+
     if not args:
         print(__doc__)
         return
-    
+
     cmd = args[0]
-    
+
     if cmd == "train":
         # Parse checkpoint: --resume (auto) or explicit path
         if len(args) > 1:
@@ -106,17 +120,17 @@ def main():
             else:
                 config.resume_from_checkpoint = args[1]
         run_training(config)
-    
+
     elif cmd == "infer":
         text = args[1] if len(args) > 1 else None
         run_inference(text, config)
-    
+
     elif cmd == "clone":
-        if len(args) < 3:
-            print("Usage: python main.py clone 'text' ref_audio.wav")
-            return
-        run_clone(args[1], args[2], config)
-    
+        # Accept defaults if not enough args
+        text = args[1] if len(args) > 1 else None
+        ref_audio = args[2] if len(args) > 2 else None
+        run_clone(text, ref_audio, config)
+
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)

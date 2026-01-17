@@ -20,14 +20,6 @@ logger = logging.getLogger("spark_tts")
 DEFAULT_MIN_DURATION = 0.5   # seconds
 DEFAULT_MAX_DURATION = 20.0  # seconds
 
-# Marker for completion start (loss computed from here)
-COMPLETION_START_TOKEN = "<|start_global_token|>"
-
-# Sequence length filtering constants
-# Conservative character-to-token ratio estimate (most tokens are 1-4 chars)
-CHAR_TO_TOKEN_RATIO = 4
-
-
 def get_audio_duration(audio_path: str) -> float:
     """Get audio duration in seconds without loading full audio."""
     try:
@@ -230,12 +222,6 @@ def build_cloning_pairs(
                     target_text=target["text"],
                     audio_tokenizer=audio_tokenizer,
                 )
-                
-                # Filter by length (prompt + completion) - rough character estimate
-                total_len = len(tokenized["prompt"]) + len(tokenized["completion"])
-                if total_len > max_seq_length * CHAR_TO_TOKEN_RATIO:
-                    continue
-                    
                 cloning_samples.append(tokenized)
             except Exception as e:
                 logger.warning(f"Skipping cloning pair {ref['audio_path']} -> {target['audio_path']}: {e}")
@@ -265,6 +251,7 @@ def tokenize_for_training(
     """
     tokenized_samples = []
     skipped_count = 0
+    logged_errors = 0
     
     for sample in tqdm(samples, desc="Tokenizing for training", unit="sample"):
         try:
@@ -309,11 +296,14 @@ def tokenize_for_training(
             })
         except Exception as e:
             skipped_count += 1
-            logger.warning(f"Error tokenizing sample: {e}")
+            # Avoid spamming logs on large datasets
+            if logged_errors < 3:
+                logger.warning(f"Error tokenizing sample: {e}")
+                logged_errors += 1
             continue
     
     if skipped_count > 0:
-        logger.warning(f"⚠️  Skipped {skipped_count} samples during tokenization")
+        logger.warning(f"Skipped {skipped_count} samples during tokenization")
     
     return tokenized_samples
 
@@ -378,7 +368,7 @@ def load_local_dataset(
     cache_path = Path(cache_dir)
     
     # Include all params in cache key for proper invalidation
-    cache_str = f"{data_dir}:{speaker_name}:{model_dir}:{min_duration}:{max_duration}:{max_seq_length}:{CHAR_TO_TOKEN_RATIO}:{sample_rate}:{use_cloning_pairs}:{cloning_pairs_per_speaker}"
+    cache_str = f"{data_dir}:{speaker_name}:{model_dir}:{min_duration}:{max_duration}:{max_seq_length}:{sample_rate}:{use_cloning_pairs}:{cloning_pairs_per_speaker}"
     cache_key = hashlib.md5(cache_str.encode()).hexdigest()[:12]
     dataset_cache = cache_path / cache_key
     
@@ -387,12 +377,14 @@ def load_local_dataset(
         cached_dataset = load_from_disk(str(dataset_cache))
         logger.info(f"Cached dataset size: {len(cached_dataset)} samples")
         if len(cached_dataset) < 100:
-            logger.warning(f"⚠️  Cached dataset seems unusually small ({len(cached_dataset)} samples)")
-            logger.warning("   Consider clearing cache if this is unexpected")
+            logger.warning(f"Cached dataset seems unusually small ({len(cached_dataset)} samples)")
+            logger.warning("Consider clearing cache if this is unexpected")
         return cached_dataset
     
     samples = []
     duration_filtered = 0
+    no_transcript = 0
+    empty_text = 0
 
     # Find all speaker directories
     speaker_dirs = []
@@ -414,11 +406,13 @@ def load_local_dataset(
         for wav_path in wav_files:
             audio_id = wav_path.stem
             if audio_id not in transcripts:
+                no_transcript += 1
                 continue
 
             transcript_data = transcripts[audio_id]
             text = transcript_data["transcript"]
             if not text.strip():
+                empty_text += 1
                 continue
 
             # Duration filter (before expensive tokenization)
@@ -433,15 +427,21 @@ def load_local_dataset(
                 "speaker": speaker_dir.name,
             })
 
-    if duration_filtered > 0:
-        logger.info(f"Filtered {duration_filtered} samples by duration ({min_duration}-{max_duration}s)")
+    logger.info(
+        "Loaded %d samples (filtered: no_transcript=%d, empty_text=%d, duration=%d)",
+        len(samples),
+        no_transcript,
+        empty_text,
+        duration_filtered,
+    )
 
     if not samples:
         raise ValueError(f"No valid samples found in {data_dir}")
 
     # Process regular samples (same-utterance: text + global + semantic from same audio)
     processed = []
-    seq_length_filtered = 0
+    tokenization_errors = 0
+    logged_tokenize_errors = 0
     for sample in tqdm(samples, desc="Tokenizing audio", unit="file"):
         try:
             tokenized = preprocess_sample(
@@ -449,21 +449,18 @@ def load_local_dataset(
                 text=sample["text"],
                 audio_tokenizer=audio_tokenizer,
             )
-            # Quick character-based filter (rough estimate to avoid expensive tokenization)
-            # Most tokens are 1-4 chars, so max_seq_length * CHAR_TO_TOKEN_RATIO is conservative
-            total_len = len(tokenized["prompt"]) + len(tokenized["completion"])
-            if total_len > max_seq_length * CHAR_TO_TOKEN_RATIO:
-                seq_length_filtered += 1
-                continue
             processed.append(tokenized)
         except Exception as e:
-            logger.warning(f"Skipping {sample['audio_path']}: {e}")
+            tokenization_errors += 1
+            # Avoid spamming logs on large datasets
+            if logged_tokenize_errors < 3:
+                logger.warning(f"Skipping {sample['audio_path']}: {e}")
+                logged_tokenize_errors += 1
             continue
 
-    if seq_length_filtered > 0:
-        logger.info(f"Filtered {seq_length_filtered} samples exceeding max_seq_length")
-    
     logger.info(f"Processed {len(processed)} regular samples")
+    if tokenization_errors > 0:
+        logger.warning(f"{tokenization_errors} samples failed tokenization")
 
     # Build cross-utterance cloning pairs for zero-shot training
     if use_cloning_pairs:
@@ -497,6 +494,12 @@ def load_local_dataset(
     
     dataset = Dataset.from_list(final_samples)
     logger.info(f"Final dataset size: {len(dataset)} samples")
+    
+    # Summary of filtering
+    total_raw = len(samples)
+    total_final = len(dataset)
+    retention_rate = (total_final / total_raw * 100) if total_raw > 0 else 0
+    logger.info(f"Dataset filtering summary: {total_raw} raw → {total_final} final ({retention_rate:.1f}% retained)")
     
     cache_path.mkdir(parents=True, exist_ok=True)
     dataset.save_to_disk(str(dataset_cache))

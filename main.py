@@ -3,6 +3,7 @@ Spark-TTS: Text-to-Speech training and inference.
 
 Usage:
     python main.py train                           # Train from scratch (two-phase)
+    python main.py train --limit 700               # Test with limited samples
     python main.py train outputs/phase1/ckpt-500   # Resume phase 1
     python main.py train outputs/checkpoint-1000   # Resume phase 2
     python main.py train --resume                  # Auto-detect latest checkpoint
@@ -40,6 +41,7 @@ def run_inference(text: str | None, config: Config):
             max_seq_length=config.max_seq_length,
             dtype=config.dtype,
             load_in_4bit=config.load_in_4bit,
+            attn_implementation="flash_attention_2",
         )
     else:
         model, tokenizer = load_model(config)
@@ -47,11 +49,16 @@ def run_inference(text: str | None, config: Config):
     FastModel.for_inference(model)
     audio_tokenizer = AudioTokenizer(config.model_dir, str(config.device))
     
-    wav = generate_speech(text, model, tokenizer, audio_tokenizer, config)
+    # Prefer conditioning on a reference speaker (more reliable than generating global tokens from scratch).
+    wav = None
+    if getattr(config, "default_ref_audio", None) and Path(str(config.default_ref_audio)).exists():
+        wav = generate_speech_clone(text, str(config.default_ref_audio), model, tokenizer, audio_tokenizer, config)
+    else:
+        wav = generate_speech(text, model, tokenizer, audio_tokenizer, config)
     
     if wav.size > 0:
-        save_audio(wav, "generated_speech1.wav", config.sample_rate)
-        return "generated_speech1.wav"
+        save_audio(wav, "generated_speech.wav", config.sample_rate)
+        return "generated_speech.wav"
     
     logger.error("Generation failed")
     return None
@@ -63,7 +70,7 @@ def run_clone(text: str | None = None, ref_audio: str | None = None, config: Con
 
     # Default text and reference audio if not provided
     default_text = "जिसमें जीवन के उच्च आध्यात्मिक मूल्य जीवन की निम्नता और भौतिकता के सम्मुख असमर्थ होते महासमर-बंधन प्रतीत होते हैं और हस्तिनापुर का जीवन महाभारत के युद्ध की दिशा ग्रहण करने लगता है।"
-    default_ref_audio = "data/samples/GNR_hi.wav"
+    default_ref_audio = "GNR_hi.wav"
 
     effective_text = text
     effective_ref_audio = ref_audio
@@ -85,6 +92,7 @@ def run_clone(text: str | None = None, ref_audio: str | None = None, config: Con
             max_seq_length=config.max_seq_length,
             dtype=config.dtype,
             load_in_4bit=config.load_in_4bit,
+            attn_implementation="flash_attention_2",
         )
     else:
         model, tokenizer = load_model(config)
@@ -95,8 +103,8 @@ def run_clone(text: str | None = None, ref_audio: str | None = None, config: Con
     wav = generate_speech_clone(effective_text, effective_ref_audio, model, tokenizer, audio_tokenizer, config)
 
     if wav.size > 0:
-        save_audio(wav, "cloned_speech1.wav", config.sample_rate)
-        return "cloned_speech1.wav"
+        save_audio(wav, "cloned_speech.wav", config.sample_rate)
+        return "cloned_speech.wav"
 
     logger.error("Voice cloning failed")
     return None
@@ -113,12 +121,19 @@ def main():
     cmd = args[0]
 
     if cmd == "train":
-        # Parse checkpoint: --resume (auto) or explicit path
-        if len(args) > 1:
-            if args[1] == "--resume":
+        # Parse options: --resume, --limit N
+        i = 1
+        while i < len(args):
+            if args[i] == "--resume":
                 config.resume_from_checkpoint = True
-            else:
-                config.resume_from_checkpoint = args[1]
+            elif args[i] == "--limit" and i + 1 < len(args):
+                config.sample_limit = int(args[i + 1])
+                logger.info(f"Sample limit set to {config.sample_limit}")
+                i += 1
+            elif not args[i].startswith("--"):
+                # Assume it's a checkpoint path
+                config.resume_from_checkpoint = args[i]
+            i += 1
         run_training(config)
 
     elif cmd == "infer":

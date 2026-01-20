@@ -7,7 +7,7 @@ import json
 import re
 from pathlib import Path
 
-DATA_DIR = "dataset"
+DATA_DIR = "datasets"
 OUTPUT_FILE = "data/indic_corpus.txt"
 
 

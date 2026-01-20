@@ -8,7 +8,7 @@ from pathlib import Path
 
 CORPUS_FILE = "data/indic_corpus.txt"
 MODEL_PREFIX = "data/indic_tokenizer"
-VOCAB_SIZE = 8000
+VOCAB_SIZE = 15000
 
 
 def train_tokenizer(corpus_file: str = CORPUS_FILE, model_prefix: str = MODEL_PREFIX):

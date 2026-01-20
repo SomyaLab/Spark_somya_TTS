@@ -26,6 +26,38 @@ def _get_eos_token_id(tokenizer) -> int:
 
 
 @torch.inference_mode()
+def _generate_text(
+    model,
+    model_inputs,
+    tokenizer,
+    config: Config,
+    *,
+    do_sample: bool,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float | None = None,
+) -> str:
+    eos_token_id = _get_eos_token_id(tokenizer)
+    gen_kwargs = {}
+    if repetition_penalty is not None:
+        gen_kwargs["repetition_penalty"] = float(repetition_penalty)
+    generated_ids = model.generate(
+        **model_inputs,
+        max_new_tokens=config.max_new_audio_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        **gen_kwargs,
+    )
+    generated_ids_trimmed = generated_ids[:, model_inputs.input_ids.shape[1] :]
+    return tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=False)[0]
+
+
+@torch.inference_mode()
 def generate_speech(
     text: str,
     model,
@@ -59,32 +91,39 @@ def generate_speech(
 
     model_inputs = tokenizer([prompt], return_tensors="pt").to(config.device)
 
-    # Get correct EOS token for stopping generation
-    eos_token_id = _get_eos_token_id(tokenizer)
-
-    # Generate tokens
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=config.max_new_audio_tokens,
+    generated_text = _generate_text(
+        model,
+        model_inputs,
+        tokenizer,
+        config,
         do_sample=True,
         temperature=config.temperature,
         top_k=config.top_k,
         top_p=config.top_p,
-        eos_token_id=eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
+        repetition_penalty=getattr(config, "repetition_penalty", None),
     )
 
-    # Trim input tokens
-    generated_ids_trimmed = generated_ids[:, model_inputs.input_ids.shape[1]:]
-    generated_text = tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=False)[0]
-
-    logger.debug(f"Generated output (first 500 chars): {generated_text[:500]}")
+    logger.info(f"Generated output (first 300 chars): {generated_text[:300]}")
 
     # Extract semantic tokens
     semantic_matches = re.findall(r"<\|bicodec_semantic_(\d+)\|>", generated_text)
     if not semantic_matches:
-        logger.warning("No semantic tokens found in generated output")
-        return np.array([], dtype=np.float32)
+        logger.warning("No semantic tokens found (sampling). Retrying with greedy decoding.")
+        generated_text = _generate_text(
+            model,
+            model_inputs,
+            tokenizer,
+            config,
+            do_sample=False,
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+            repetition_penalty=getattr(config, "repetition_penalty", None),
+        )
+        semantic_matches = re.findall(r"<\|bicodec_semantic_(\d+)\|>", generated_text)
+        if not semantic_matches:
+            logger.warning("No semantic tokens found in generated output (even after greedy retry)")
+            return np.array([], dtype=np.float32)
 
     pred_semantic_ids = torch.tensor(
         [int(t) for t in semantic_matches]
@@ -119,9 +158,41 @@ def generate_speech(
     return wav_np
 
 
+def _wav_seems_silent(wav: np.ndarray, eps: float = 1e-4) -> bool:
+    if wav is None or wav.size == 0:
+        return True
+    if not np.isfinite(wav).all():
+        return True
+    return float(np.mean(np.abs(wav))) < eps
+
+
 def save_audio(wav: np.ndarray, path: str, sample_rate: int = 16000):
     """Save waveform to file."""
     import soundfile as sf
+    if wav is None:
+        wav = np.array([], dtype=np.float32)
+    # Ensure sane dtype/range for players.
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.size and not np.isfinite(wav).all():
+        logger.warning("Waveform contains NaN/Inf; replacing with zeros")
+        wav = np.nan_to_num(wav, nan=0.0, posinf=0.0, neginf=0.0)
+    # Normalize if extremely quiet (common when detokenizer outputs low amplitude).
+    if wav.size:
+        peak = float(np.max(np.abs(wav)))
+        if peak > 0:
+            # RMS normalization helps when output is "technically non-zero" but perceived as silence.
+            rms = float(np.sqrt(np.mean(np.square(wav), dtype=np.float64)))
+            target_rms = 0.05
+            if rms > 0 and rms < target_rms:
+                gain = min(target_rms / rms, 30.0)  # cap amplification
+                wav = wav * gain
+            # Also ensure we have a healthy peak.
+            peak = float(np.max(np.abs(wav)))
+            if peak > 0 and peak < 0.5:
+                wav = wav / peak * 0.95
+    # Soft clip to [-1, 1] to avoid overflow in PCM conversion.
+    if wav.size:
+        wav = np.clip(wav, -1.0, 1.0)
     sf.write(path, wav, sample_rate)
     logger.info(f"Audio saved to {path}")
 
@@ -176,32 +247,39 @@ def generate_speech_clone(
 
     model_inputs = tokenizer([prompt], return_tensors="pt").to(config.device)
 
-    # Get correct EOS token for stopping generation
-    eos_token_id = _get_eos_token_id(tokenizer)
-
-    # Generate only semantic tokens (global tokens already provided)
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=config.max_new_audio_tokens,
+    generated_text = _generate_text(
+        model,
+        model_inputs,
+        tokenizer,
+        config,
         do_sample=True,
         temperature=config.temperature,
         top_k=config.top_k,
         top_p=config.top_p,
-        eos_token_id=eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
+        repetition_penalty=config.repetition_penalty,
     )
 
-    # Trim input tokens
-    generated_ids_trimmed = generated_ids[:, model_inputs.input_ids.shape[1]:]
-    generated_text = tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=False)[0]
-
-    logger.debug(f"Generated output (first 500 chars): {generated_text[:500]}")
+    logger.info(f"Generated output (first 300 chars): {generated_text[:300]}")
 
     # Extract semantic tokens from generated output
     semantic_matches = re.findall(r"<\|bicodec_semantic_(\d+)\|>", generated_text)
     if not semantic_matches:
-        logger.warning("No semantic tokens found in generated output")
-        return np.array([], dtype=np.float32)
+        logger.warning("No semantic tokens found (sampling). Retrying with greedy decoding.")
+        generated_text = _generate_text(
+            model,
+            model_inputs,
+            tokenizer,
+            config,
+            do_sample=False,
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+            repetition_penalty=config.repetition_penalty,
+        )
+        semantic_matches = re.findall(r"<\|bicodec_semantic_(\d+)\|>", generated_text)
+        if not semantic_matches:
+            logger.warning("No semantic tokens found in generated output (even after greedy retry)")
+            return np.array([], dtype=np.float32)
 
     pred_semantic_ids = torch.tensor(
         [int(t) for t in semantic_matches]

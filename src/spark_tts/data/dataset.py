@@ -3,11 +3,14 @@
 import json
 import hashlib
 import logging
+import os
 import random
+import time
 from pathlib import Path
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
-import librosa
+import numpy as np
 import soundfile as sf
 from datasets import Dataset, load_from_disk
 from tqdm import tqdm
@@ -17,18 +20,145 @@ from .tokenizer import AudioTokenizer
 logger = logging.getLogger("spark_tts")
 
 # Default duration limits (can be overridden via config)
-DEFAULT_MIN_DURATION = 0.5   # seconds
-DEFAULT_MAX_DURATION = 20.0  # seconds
+DEFAULT_MIN_DURATION = 0.05   # seconds
+DEFAULT_MAX_DURATION = 30.0  # seconds
 
-def get_audio_duration(audio_path: str) -> float:
-    """Get audio duration in seconds without loading full audio."""
+def get_audio_duration(audio_path: str) -> float | None:
+    """Get audio duration in seconds without loading full audio.
+    
+    Returns None if file is empty/corrupted.
+    """
+    # Check for empty files first
+    if os.path.getsize(audio_path) == 0:
+        return None
+    
     try:
         info = sf.info(audio_path)
         return info.duration
     except Exception:
-        # Fallback: load with librosa
-        audio, sr = librosa.load(audio_path, sr=None)
-        return len(audio) / sr
+        # Fallback: try loading with soundfile
+        try:
+            audio, sr = sf.read(audio_path)
+            return len(audio) / sr
+        except Exception:
+            return None
+
+
+def load_audio_fast(audio_path: str) -> tuple:
+    """Load audio using soundfile (fast and reliable for WAV).
+    
+    Returns:
+        Tuple of (audio_array as numpy, sample_rate)
+    """
+    audio, sr = sf.read(audio_path)
+    # Convert to mono if stereo
+    if len(audio.shape) > 1:
+        audio = audio.mean(axis=1)
+    return audio.astype(np.float32), sr
+
+
+def preprocess_samples_batched(
+    samples: list[dict],
+    audio_tokenizer: AudioTokenizer,
+    batch_size: int = 16,
+    num_workers: int = 4,
+) -> list[dict]:
+    """
+    Process samples in batches for faster tokenization.
+    
+    Uses parallel audio loading and batched GPU tokenization.
+    
+    Args:
+        samples: List of sample dicts with audio_path, text
+        audio_tokenizer: AudioTokenizer instance
+        batch_size: Number of samples to process in each GPU batch
+        num_workers: Number of parallel workers for audio loading
+        
+    Returns:
+        List of processed dicts with prompt and completion
+    """
+    processed = []
+    errors = 0
+    logged_errors = 0
+    
+    def load_single(sample):
+        """Load a single audio file (for parallel execution)."""
+        try:
+            audio, sr = load_audio_fast(sample["audio_path"])
+            if len(audio) == 0:
+                return None
+            return {
+                "audio": audio,
+                "sr": sr,
+                "text": sample["text"],
+                "audio_path": sample["audio_path"],
+            }
+        except Exception:
+            return None
+    
+    # Process in batches
+    total_batches = (len(samples) + batch_size - 1) // batch_size
+    pbar = tqdm(total=len(samples), desc="Tokenizing audio (batched)", unit="file")
+    
+    for batch_start in range(0, len(samples), batch_size):
+        batch_samples = samples[batch_start:batch_start + batch_size]
+        
+        # Parallel audio loading
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            loaded = list(executor.map(load_single, batch_samples))
+        
+        # Filter out failed loads
+        valid_loaded = [l for l in loaded if l is not None]
+        batch_errors = len(loaded) - len(valid_loaded)
+        errors += batch_errors
+        
+        if not valid_loaded:
+            pbar.update(len(batch_samples))
+            continue
+        
+        # Batched tokenization
+        try:
+            audio_arrays = [l["audio"] for l in valid_loaded]
+            sampling_rates = [l["sr"] for l in valid_loaded]
+            
+            token_results = audio_tokenizer.tokenize_audio_batch(audio_arrays, sampling_rates)
+            
+            # Build output dicts
+            for item, (global_tokens, semantic_tokens) in zip(valid_loaded, token_results):
+                if not global_tokens or not semantic_tokens:
+                    errors += 1
+                    continue
+                
+                prompt = "".join([
+                    "<|task_tts|>",
+                    "<|start_content|>",
+                    item["text"],
+                    "<|end_content|>",
+                ])
+                
+                completion = "".join([
+                    "<|start_global_token|>",
+                    global_tokens,
+                    "<|end_global_token|>",
+                    "<|start_semantic_token|>",
+                    semantic_tokens,
+                    "<|end_semantic_token|>",
+                    "<|im_end|>",
+                ])
+                
+                processed.append({"prompt": prompt, "completion": completion})
+                
+        except Exception as e:
+            # Fallback to single processing for this batch
+            errors += len(valid_loaded)
+            if logged_errors < 3:
+                logger.warning(f"Batch tokenization failed, skipping batch: {e}")
+                logged_errors += 1
+        
+        pbar.update(len(batch_samples))
+    
+    pbar.close()
+    return processed, errors
 
 
 def preprocess_sample(
@@ -58,7 +188,7 @@ def preprocess_sample(
         raise ValueError(f"Empty text for audio: {audio_path}")
     
     try:
-        audio_array, sr = librosa.load(audio_path, sr=None)
+        audio_array, sr = load_audio_fast(audio_path)
         if len(audio_array) == 0:
             raise ValueError(f"Empty audio file: {audio_path}")
     except Exception as e:
@@ -125,7 +255,7 @@ def preprocess_cloning_pair(
     
     # Extract global tokens from reference audio (speaker identity)
     try:
-        ref_audio, ref_sr = librosa.load(ref_audio_path, sr=None)
+        ref_audio, ref_sr = load_audio_fast(ref_audio_path)
         if len(ref_audio) == 0:
             raise ValueError(f"Empty reference audio: {ref_audio_path}")
         ref_global_tokens, _ = audio_tokenizer.tokenize_audio(ref_audio, ref_sr)
@@ -136,7 +266,7 @@ def preprocess_cloning_pair(
     
     # Extract semantic tokens from target audio (content)
     try:
-        target_audio, target_sr = librosa.load(target_audio_path, sr=None)
+        target_audio, target_sr = load_audio_fast(target_audio_path)
         if len(target_audio) == 0:
             raise ValueError(f"Empty target audio: {target_audio_path}")
         _, target_semantic_tokens = audio_tokenizer.tokenize_audio(target_audio, target_sr)
@@ -344,6 +474,9 @@ def load_local_dataset(
     sample_rate: int = 16000,
     use_cloning_pairs: bool = True,
     cloning_pairs_per_speaker: int = 5,
+    sample_limit: int | None = None,
+    num_loading_workers: int = 4,
+    tokenizer_batch_size: int = 8,
 ) -> Dataset:
     """
     Load local dataset from IISc SYSPIN data structure.
@@ -363,12 +496,15 @@ def load_local_dataset(
         sample_rate: Audio sample rate (for cache key)
         use_cloning_pairs: Whether to generate cross-utterance cloning pairs
         cloning_pairs_per_speaker: Number of cloning pairs per speaker
+        sample_limit: Maximum number of samples to process (for testing)
+        num_loading_workers: Number of parallel workers for audio loading
+        tokenizer_batch_size: Batch size for GPU tokenization
     """
     data_path = Path(data_dir)
     cache_path = Path(cache_dir)
     
     # Include all params in cache key for proper invalidation
-    cache_str = f"{data_dir}:{speaker_name}:{model_dir}:{min_duration}:{max_duration}:{max_seq_length}:{sample_rate}:{use_cloning_pairs}:{cloning_pairs_per_speaker}"
+    cache_str = f"{data_dir}:{speaker_name}:{model_dir}:{min_duration}:{max_duration}:{max_seq_length}:{sample_rate}:{use_cloning_pairs}:{cloning_pairs_per_speaker}:{sample_limit}"
     cache_key = hashlib.md5(cache_str.encode()).hexdigest()[:12]
     dataset_cache = cache_path / cache_key
     
@@ -417,6 +553,10 @@ def load_local_dataset(
 
             # Duration filter (before expensive tokenization)
             duration = get_audio_duration(str(wav_path))
+            if duration is None:
+                # Corrupted or empty file
+                duration_filtered += 1
+                continue
             if duration < min_duration or duration > max_duration:
                 duration_filtered += 1
                 continue
@@ -428,7 +568,7 @@ def load_local_dataset(
             })
 
     logger.info(
-        "Loaded %d samples (filtered: no_transcript=%d, empty_text=%d, duration=%d)",
+        "Found %d samples (filtered: no_transcript=%d, empty_text=%d, duration=%d)",
         len(samples),
         no_transcript,
         empty_text,
@@ -437,28 +577,27 @@ def load_local_dataset(
 
     if not samples:
         raise ValueError(f"No valid samples found in {data_dir}")
+    
+    # Apply sample limit for testing
+    if sample_limit is not None and sample_limit > 0:
+        original_count = len(samples)
+        samples = samples[:sample_limit]
+        logger.info(f"Applied sample_limit: {original_count} → {len(samples)} samples")
 
-    # Process regular samples (same-utterance: text + global + semantic from same audio)
-    processed = []
-    tokenization_errors = 0
-    logged_tokenize_errors = 0
-    for sample in tqdm(samples, desc="Tokenizing audio", unit="file"):
-        try:
-            tokenized = preprocess_sample(
-                audio_path=sample["audio_path"],
-                text=sample["text"],
-                audio_tokenizer=audio_tokenizer,
-            )
-            processed.append(tokenized)
-        except Exception as e:
-            tokenization_errors += 1
-            # Avoid spamming logs on large datasets
-            if logged_tokenize_errors < 3:
-                logger.warning(f"Skipping {sample['audio_path']}: {e}")
-                logged_tokenize_errors += 1
-            continue
-
-    logger.info(f"Processed {len(processed)} regular samples")
+    # Process regular samples with batched GPU tokenization
+    logger.info(f"Tokenizing {len(samples)} audio files (batch_size={tokenizer_batch_size})...")
+    start_time = time.time()
+    
+    processed, tokenization_errors = preprocess_samples_batched(
+        samples=samples,
+        audio_tokenizer=audio_tokenizer,
+        batch_size=tokenizer_batch_size,
+        num_workers=num_loading_workers,
+    )
+    
+    elapsed = time.time() - start_time
+    rate = len(processed) / elapsed if elapsed > 0 else 0
+    logger.info(f"Processed {len(processed)} regular samples in {elapsed:.1f}s ({rate:.1f} files/sec)")
     if tokenization_errors > 0:
         logger.warning(f"{tokenization_errors} samples failed tokenization")
 

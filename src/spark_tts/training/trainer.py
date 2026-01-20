@@ -7,7 +7,7 @@ from huggingface_hub import snapshot_download
 from unsloth import FastModel
 from trl import SFTConfig, SFTTrainer
 from datasets import Dataset
-from transformers import TrainerCallback
+from transformers import TrainerCallback, AutoTokenizer
 
 from ..config import Config
 from ..data.tokenizer import AudioTokenizer
@@ -25,8 +25,55 @@ class NormalizedLossCallback(TrainerCallback):
             raw_loss = logs["loss"]
             normalized_loss = raw_loss / ga_steps
             logs["loss_normalized"] = normalized_loss
-            # Print directly to ensure visibility
-            print(f"  → Normalized loss: {normalized_loss:.4f} (raw: {raw_loss:.4f}, GA={ga_steps})")
+
+
+class PrettyLogsCallback(TrainerCallback):
+    """Concise, readable console logs (doesn't affect training)."""
+    
+    def __init__(self, every_n_steps: int = 10):
+        self.every_n_steps = max(int(every_n_steps), 0)
+    
+    def _should_print(self, state) -> bool:
+        if self.every_n_steps <= 0:
+            return False
+        # Print at step 1 and then every N steps to avoid spamming
+        return state.global_step == 1 or (state.global_step % self.every_n_steps == 0)
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or not self._should_print(state):
+            return
+        # HF typically provides: loss, learning_rate, grad_norm, epoch, step, etc.
+        loss = logs.get("loss")
+        loss_norm = logs.get("loss_normalized")
+        lr = logs.get("learning_rate")
+        grad_norm = logs.get("grad_norm")
+        
+        parts = [f"step={state.global_step}"]
+        if loss is not None:
+            if loss_norm is not None:
+                parts.append(f"loss={loss:.4f} (norm={loss_norm:.4f})")
+            else:
+                parts.append(f"loss={loss:.4f}")
+        if lr is not None:
+            parts.append(f"lr={lr:.2e}")
+        if grad_norm is not None:
+            parts.append(f"grad_norm={grad_norm:.2f}")
+        
+        logger.info(" | ".join(parts))
+    
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics:
+            return
+        eval_loss = metrics.get("eval_loss")
+        if eval_loss is None:
+            return
+        msg = f"eval | step={state.global_step} | eval_loss={eval_loss:.4f}"
+        if getattr(state, "best_metric", None) is not None:
+            # best_metric corresponds to metric_for_best_model
+            msg += f" | best={state.best_metric:.4f}"
+        if getattr(state, "best_model_checkpoint", None):
+            msg += f" | best_ckpt={Path(state.best_model_checkpoint).name}"
+        logger.info(msg)
 
 
 def setup_logging(level: str = "INFO"):
@@ -85,33 +132,150 @@ def _detect_resume_phase(checkpoint: str | bool, config: Config) -> tuple[str | 
     return None, 1
 
 
+def _get_base_tokenizer_len(config: Config) -> int | None:
+    """Best-effort: load base tokenizer length (pre-extension).
+
+    We use this to identify the range of *newly added* tokens in an extended tokenizer.
+    Assumption: new tokens were appended (HF `tokenizer.add_tokens`) so new IDs are
+    contiguous in [base_len, extended_len).
+    """
+    base_tok_path = Path(config.model_dir) / "LLM"
+    if not base_tok_path.exists():
+        # Ensure base model exists locally (needed to load base tokenizer).
+        try:
+            logger.info(f"Downloading base model {config.model_name} to {config.model_dir} (for base tokenizer)")
+            snapshot_download(config.model_name, local_dir=config.model_dir)
+        except Exception as e:
+            logger.warning(f"Failed to download base model for tokenizer length: {e}")
+            return None
+
+    try:
+        base_tok = AutoTokenizer.from_pretrained(str(base_tok_path))
+        return len(base_tok)
+    except Exception as e:
+        logger.warning(f"Failed to load base tokenizer from {base_tok_path}: {e}")
+        return None
+
+
+def _mask_embedding_grads_to_new_tokens(
+    model,
+    tokenizer,
+    config: Config,
+) -> tuple[torch.utils.hooks.RemovableHandle | None, dict]:
+    """Restrict embedding gradient updates to new tokens only (Phase 1 stability).
+
+    This prevents Phase 1 from accidentally training the entire embedding table
+    (including audio tokens), which can cause huge gradient norms and instability.
+    """
+    if not (config.use_extended_model and Path(config.extended_model_dir).exists()):
+        return None, {"enabled": False, "reason": "not_using_extended_model"}
+
+    base_len = _get_base_tokenizer_len(config)
+    if base_len is None:
+        return None, {"enabled": False, "reason": "base_tokenizer_unavailable"}
+
+    ext_len = len(tokenizer)
+    if ext_len <= base_len:
+        return None, {"enabled": False, "reason": "no_new_tokens_detected", "base_len": base_len, "ext_len": ext_len}
+
+    emb = getattr(model, "get_input_embeddings", None)
+    if emb is None or model.get_input_embeddings() is None:
+        return None, {"enabled": False, "reason": "no_input_embeddings"}
+
+    emb_weight = model.get_input_embeddings().weight
+
+    # Freeze everything, then train only embedding weights (row-masked to new tokens).
+    for p in model.parameters():
+        p.requires_grad = False
+    emb_weight.requires_grad = True
+
+    # Row mask: 1 for new tokens, 0 otherwise. Keep fp32 for numerical stability.
+    # Shape: [vocab, 1] so it broadcasts over hidden dim.
+    row_mask = torch.zeros((emb_weight.shape[0], 1), device=emb_weight.device, dtype=torch.float32)
+    row_mask[base_len:ext_len] = 1.0
+
+    def _hook(grad: torch.Tensor) -> torch.Tensor:
+        # Grad can be fp32 even when params are bf16; multiply mask safely.
+        if grad is None:
+            return grad
+        # Important: do NOT change dtype of grad (PyTorch will error).
+        mask = row_mask
+        if mask.device != grad.device:
+            mask = mask.to(device=grad.device)
+        if mask.dtype != grad.dtype:
+            mask = mask.to(dtype=grad.dtype)
+        return grad * mask
+
+    handle = emb_weight.register_hook(_hook)
+    info = {
+        "enabled": True,
+        "base_len": base_len,
+        "ext_len": ext_len,
+        "new_tokens": ext_len - base_len,
+    }
+    return handle, info
+
+
 def _build_sft_config(config: Config, output_dir: str, max_steps: int, lr: float, **overrides) -> SFTConfig:
     """Create SFTConfig for training with pre-tokenized dataset."""
+    # Safety guard: full finetuning is extremely sensitive to LR. If LR is too high,
+    # you can get "looks like training works" loss, but completely broken generations.
+    effective_lr = lr
+    try:
+        if (
+            getattr(config, "full_finetuning", False)
+            and not getattr(config, "unsafe_allow_high_lr", False)
+            and lr is not None
+            and float(lr) > 5e-5
+        ):
+            logger.warning(
+                "Clamping learning_rate from %.2e to %.2e for stability (set unsafe_allow_high_lr=True to disable).",
+                float(lr),
+                5e-5,
+            )
+            effective_lr = 5e-5
+    except Exception:
+        # If anything goes wrong, fall back to provided LR.
+        effective_lr = lr
+
     return SFTConfig(
         per_device_train_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         warmup_steps=overrides.get("warmup_steps", config.warmup_steps),
         max_steps=max_steps,
-        learning_rate=lr,
+        learning_rate=effective_lr,
         logging_steps=config.logging_steps,
-        optim="adamw_8bit",
+        optim=getattr(config, "optim", "adamw_8bit"),
         weight_decay=config.weight_decay,
         lr_scheduler_type=overrides.get("lr_scheduler_type", config.lr_scheduler_type),
         seed=config.seed,
         output_dir=output_dir,
         save_steps=overrides.get("save_steps", config.save_steps),
+        save_total_limit=overrides.get("save_total_limit", config.save_total_limit),
         max_grad_norm=config.max_grad_norm,
         label_smoothing_factor=config.label_smoothing,
         fp16=False,
         bf16=True,
         logging_dir=f"{output_dir}/logs",
         report_to="tensorboard",
+        eval_strategy=overrides.get("eval_strategy", config.evaluation_strategy),
+        eval_steps=overrides.get("eval_steps", config.eval_steps),
+        load_best_model_at_end=overrides.get("load_best_model_at_end", config.load_best_model_at_end),
+        metric_for_best_model=overrides.get("metric_for_best_model", config.metric_for_best_model),
+        greater_is_better=overrides.get("greater_is_better", config.greater_is_better),
         # Note: dataset is pre-tokenized with input_ids/labels, no text field needed
         max_seq_length=config.max_seq_length,
     )
 
 
-def _create_trainer(model, tokenizer, dataset: Dataset, config: Config, sft_config: SFTConfig) -> SFTTrainer:
+def _create_trainer(
+    model,
+    tokenizer,
+    dataset: Dataset,
+    config: Config,
+    sft_config: SFTConfig,
+    eval_dataset: Dataset | None = None,
+) -> SFTTrainer:
     """Create SFTTrainer for fine-tuning.
     
     Args:
@@ -128,9 +292,13 @@ def _create_trainer(model, tokenizer, dataset: Dataset, config: Config, sft_conf
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         packing=False,
         args=sft_config,
-        callbacks=[NormalizedLossCallback()],
+        callbacks=[
+            NormalizedLossCallback(),
+            PrettyLogsCallback(every_n_steps=config.pretty_log_steps),
+        ],
     )
 
 
@@ -183,6 +351,7 @@ def load_model(config: Config) -> tuple:
             dtype=config.dtype,
             full_finetuning=config.full_finetuning,
             load_in_4bit=config.load_in_4bit,
+            attn_implementation="flash_attention_2",
         )
         
         logger.info(f"Vocabulary size: {len(tokenizer)}")
@@ -239,7 +408,13 @@ def save_model(model, tokenizer, config: Config, merge: bool = False) -> None:
         raise
 
 
-def train(model, tokenizer, dataset: Dataset, config: Config) -> dict:
+def train(
+    model,
+    tokenizer,
+    dataset: Dataset,
+    config: Config,
+    eval_dataset: Dataset | None = None,
+) -> dict:
     """Two-phase training pipeline with auto-resume.
     
     Args:
@@ -260,32 +435,68 @@ def train(model, tokenizer, dataset: Dataset, config: Config) -> dict:
     checkpoint, start_phase = _detect_resume_phase(config.resume_from_checkpoint, config)
     
     phase1_stats = None
+    embedding_grad_hook = None
     
     # ==================== PHASE 1: Embedding Warmup ====================
     if start_phase == 1:
         logger.info("=" * 30 + " PHASE 1: Embedding Warmup " + "=" * 30)
         
         if config.freeze_base_during_warmup:
-            frozen = 0
-            for name, param in model.named_parameters():
-                if 'embed' not in name.lower() and 'lm_head' not in name.lower():
-                    param.requires_grad = False
-                    frozen += 1
-            logger.info(f"Frozen {frozen} params, training embeddings only")
+            if getattr(config, "phase1_train_new_tokens_only", True):
+                embedding_grad_hook, info = _mask_embedding_grads_to_new_tokens(model, tokenizer, config)
+                if info.get("enabled"):
+                    logger.info(
+                        "Phase 1: training only NEW token embeddings | base_vocab=%s | extended_vocab=%s | new_tokens=%s",
+                        info["base_len"],
+                        info["ext_len"],
+                        info["new_tokens"],
+                    )
+                else:
+                    logger.info(f"Phase 1 new-token-only mode disabled/fallback: {info.get('reason')}")
+                    frozen = 0
+                    for name, param in model.named_parameters():
+                        if 'embed' not in name.lower() and 'lm_head' not in name.lower():
+                            param.requires_grad = False
+                            frozen += 1
+                    logger.info(f"Frozen {frozen} params, training embeddings only")
+            else:
+                frozen = 0
+                for name, param in model.named_parameters():
+                    if 'embed' not in name.lower() and 'lm_head' not in name.lower():
+                        param.requires_grad = False
+                        frozen += 1
+                logger.info(f"Frozen {frozen} params, training embeddings only")
         
         phase1_config = _build_sft_config(
             config,
             output_dir=f"{config.output_dir}/phase1",
             max_steps=config.embedding_warmup_steps,
             lr=config.embedding_warmup_lr,
-            warmup_steps=50,
+            warmup_steps=400,
             lr_scheduler_type="cosine",
+            # Default: keep Phase 1 simple/fast (no eval/best-model selection)
+            eval_strategy="steps" if (config.eval_during_phase1 and eval_dataset is not None and config.do_eval) else "no",
+            load_best_model_at_end=False,
         )
         
-        trainer = _create_trainer(model, tokenizer, dataset, config, phase1_config)
+        trainer = _create_trainer(
+            model,
+            tokenizer,
+            dataset,
+            config,
+            phase1_config,
+            eval_dataset=(eval_dataset if (config.eval_during_phase1 and eval_dataset is not None and config.do_eval) else None),
+        )
         _log_gpu_stats("Before Phase 1: ")
         phase1_stats = trainer.train(resume_from_checkpoint=checkpoint)
         logger.info(f"Phase 1 complete | Loss: {phase1_stats.metrics.get('train_loss', 'N/A')}")
+
+        if embedding_grad_hook is not None:
+            try:
+                embedding_grad_hook.remove()
+            except Exception as e:
+                logger.warning(f"Failed to remove embedding grad hook: {e}")
+            embedding_grad_hook = None
         
         checkpoint = None
     else:
@@ -302,9 +513,18 @@ def train(model, tokenizer, dataset: Dataset, config: Config) -> dict:
         output_dir=config.output_dir,
         max_steps=config.max_steps,
         lr=config.learning_rate,
+        eval_strategy=("steps" if (eval_dataset is not None and config.do_eval) else "no"),
+        load_best_model_at_end=(config.load_best_model_at_end and eval_dataset is not None and config.do_eval),
     )
     
-    trainer = _create_trainer(model, tokenizer, dataset, config, phase2_config)
+    trainer = _create_trainer(
+        model,
+        tokenizer,
+        dataset,
+        config,
+        phase2_config,
+        eval_dataset=(eval_dataset if (eval_dataset is not None and config.do_eval) else None),
+    )
     _log_gpu_stats("Before Phase 2: ")
     phase2_stats = trainer.train(resume_from_checkpoint=checkpoint)
     _log_gpu_stats("After Phase 2: ")
@@ -314,6 +534,8 @@ def train(model, tokenizer, dataset: Dataset, config: Config) -> dict:
     return {
         "phase1": phase1_stats.metrics if phase1_stats else None,
         "phase2": phase2_stats.metrics,
+        "best_model_checkpoint": getattr(trainer.state, "best_model_checkpoint", None),
+        "best_metric": getattr(trainer.state, "best_metric", None),
     }
 
 
@@ -337,11 +559,38 @@ def run_training(config: Config) -> dict:
         model_dir=config.model_dir,
         sample_rate=config.sample_rate,
         use_cloning_pairs=config.use_cloning_pairs,
+        sample_limit=config.sample_limit,
+        tokenizer_batch_size=config.tokenizer_batch_size,
     )
     logger.info(f"Dataset: {len(dataset)} samples (pre-tokenized with loss masking)")
     audio_tokenizer.offload_to_cpu()
     
-    metrics = train(model, tokenizer, dataset, config)
+    # Create evaluation split (optional). Best-model selection requires eval.
+    eval_dataset = None
+    train_dataset = dataset
+    if config.do_eval and config.val_split and config.val_split > 0:
+        try:
+            n = len(dataset)
+            if n >= 2:
+                # Ensure at least 1 sample in eval, but never all samples.
+                val_size = int(round(n * float(config.val_split)))
+                val_size = max(1, min(val_size, n - 1))
+                split = dataset.train_test_split(test_size=val_size, seed=config.seed, shuffle=True)
+                train_dataset = split["train"]
+                eval_dataset = split["test"]
+                logger.info(f"Eval enabled | train={len(train_dataset)} | eval={len(eval_dataset)} | val_split={config.val_split}")
+            else:
+                logger.warning("Eval disabled (dataset too small to split)")
+        except Exception as e:
+            logger.warning(f"Eval disabled (failed to create split): {e}")
+            train_dataset = dataset
+            eval_dataset = None
+    else:
+        logger.info("Eval disabled (do_eval=False or val_split<=0)")
+    
+    metrics = train(model, tokenizer, train_dataset, config, eval_dataset=eval_dataset)
+    if metrics.get("best_model_checkpoint"):
+        logger.info(f"Best checkpoint: {metrics['best_model_checkpoint']} (best_metric={metrics.get('best_metric')})")
     
     save_model(model, tokenizer, config)
     return metrics

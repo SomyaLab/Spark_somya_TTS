@@ -6,7 +6,7 @@ from pathlib import Path
 import librosa
 
 # === Config ===
-DATA_DIR = "dataset"
+DATA_DIR = "datasets"
 MIN_DURATION_SEC = 0.5
 MAX_DURATION_SEC = 30.0
 

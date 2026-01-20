@@ -52,41 +52,69 @@ download_and_extract() {
     local filename="$2"
     local temp_file="$TEMP_DIR/$filename"
     
-    echo "[$(date +%H:%M:%S)] Downloading $filename..."
-    if wget -q --show-progress "$url" -O "$temp_file"; then
-        echo "[$(date +%H:%M:%S)] Downloaded $filename"
-        
-        # Extract language and project type
-        local lang_name=$(extract_lang "$filename")
-        local project_type=$(extract_project_type "$filename")
-        local lang_code=$(get_lang_code "$lang_name")
-        
-        if [ -z "$lang_code" ]; then
-            echo "[$(date +%H:%M:%S)] Warning: Unknown language '$lang_name' in $filename, skipping extraction"
-            rm -f "$temp_file"
-            return 1
-        fi
-        
-        # Determine data folder name
-        local data_folder="IISc_${project_type}_Data"
-        
-        # Create language directory structure
-        local lang_dir="$DATASETS_DIR/$lang_code/$data_folder"
-        mkdir -p "$lang_dir"
-        
-        # Extract to language directory
-        # Tar files typically contain a top-level directory, extract it directly
-        echo "[$(date +%H:%M:%S)] Extracting $filename to $lang_dir..."
-        tar -xzf "$temp_file" -C "$lang_dir"
-        
-        # Clean up temp file
-        rm "$temp_file"
-        echo "[$(date +%H:%M:%S)] Completed $filename"
-    else
-        echo "[$(date +%H:%M:%S)] Error: Failed to download $filename"
+    # Extract language and project type (needed for skip checks even before downloading)
+    local lang_name=$(extract_lang "$filename")
+    local project_type=$(extract_project_type "$filename")
+    local lang_code=$(get_lang_code "$lang_name")
+    local base_dirname="${filename%.tar.gz}"   # e.g. IISc_SYSPINProject_Bengali_Female_Spk001_HC
+
+    if [ -z "$lang_code" ]; then
+        echo "[$(date +%H:%M:%S)] Warning: Unknown language '$lang_name' in $filename, skipping"
         rm -f "$temp_file"
         return 1
     fi
+
+    # Determine data folder name
+    local data_folder="IISc_${project_type}_Data"
+
+    # Create language directory structure
+    local lang_dir="$DATASETS_DIR/$lang_code/$data_folder"
+    mkdir -p "$lang_dir"
+
+    # === Skip if already extracted ===
+    # Common layouts:
+    # - Current script extraction creates: <lang_dir>/<data_folder>/<base_dirname> (double nested)
+    # - After normalization, it becomes:  <lang_dir>/<base_dirname>
+    # Additionally, SPICOR may be normalized into IISc_SYSPIN_Data with renamed prefix.
+    local extracted1="$lang_dir/$base_dirname"
+    local extracted2="$lang_dir/$data_folder/$base_dirname"
+
+    # SPICOR normalized location (if `normalize_datasets_layout.py` has already run)
+    local spicor_norm1=""
+    local spicor_norm2=""
+    if [ "$project_type" = "SPICOR" ]; then
+        local rest="${base_dirname#IISc_SPICORProject_}"
+        spicor_norm1="$DATASETS_DIR/$lang_code/IISc_SYSPIN_Data/IISc_SYSPINProject_SPICOR_${rest}"
+        spicor_norm2="$DATASETS_DIR/$lang_code/IISc_SYSPIN_Data/IISc_SYSPIN_Data/IISc_SYSPINProject_SPICOR_${rest}"
+    fi
+
+    if [ -d "$extracted1" ] || [ -d "$extracted2" ] || { [ -n "$spicor_norm1" ] && [ -d "$spicor_norm1" ]; } || { [ -n "$spicor_norm2" ] && [ -d "$spicor_norm2" ]; }; then
+        echo "[$(date +%H:%M:%S)] Skipping (already extracted): $filename"
+        rm -f "$temp_file"
+        return 0
+    fi
+
+    # === Download (or reuse existing tar) ===
+    if [ -f "$temp_file" ]; then
+        echo "[$(date +%H:%M:%S)] Found existing download, skipping wget: $filename"
+    else
+        echo "[$(date +%H:%M:%S)] Downloading $filename..."
+        if wget -q --show-progress "$url" -O "$temp_file"; then
+            echo "[$(date +%H:%M:%S)] Downloaded $filename"
+        else
+            echo "[$(date +%H:%M:%S)] Error: Failed to download $filename"
+            rm -f "$temp_file"
+            return 1
+        fi
+    fi
+
+    # === Extract ===
+    echo "[$(date +%H:%M:%S)] Extracting $filename to $lang_dir..."
+    tar -xzf "$temp_file" -C "$lang_dir"
+
+    # Clean up temp file
+    rm "$temp_file"
+    echo "[$(date +%H:%M:%S)] Completed $filename"
 }
 
 # Export functions and variables for parallel execution

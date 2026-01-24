@@ -20,7 +20,7 @@ from unsloth import FastModel
 from src.spark_tts.config import Config
 from src.spark_tts.training.trainer import run_training, setup_logging, load_model
 from src.spark_tts.data.tokenizer import AudioTokenizer
-from src.spark_tts.inference.generate import generate_speech, generate_speech_clone, save_audio
+from src.spark_tts.inference.generate import generate_speech_clone, save_audio
 
 logger = logging.getLogger("spark_tts")
 
@@ -49,21 +49,13 @@ def run_inference(text: str | None, config: Config):
     FastModel.for_inference(model)
     audio_tokenizer = AudioTokenizer(config.model_dir, str(config.device))
     
-    # Clone-conditioned inference is the default for this repo.
-    wav = None
-    obj = str(getattr(config, "train_objective", "")).lower()
-    if obj in {"clone_semantic", "clone_semantic_v1"}:
-        if getattr(config, "default_ref_audio", None) and Path(str(config.default_ref_audio)).exists():
-            wav = generate_speech_clone(text, str(config.default_ref_audio), model, tokenizer, audio_tokenizer, config)
-        else:
-            logger.error("train_objective=%s but default_ref_audio missing; cannot run infer", obj)
-            return None
-    else:
-        # Legacy fallback: allow plain generation if objective supports it.
-        if getattr(config, "default_ref_audio", None) and Path(str(config.default_ref_audio)).exists():
-            wav = generate_speech_clone(text, str(config.default_ref_audio), model, tokenizer, audio_tokenizer, config)
-        else:
-            wav = generate_speech(text, model, tokenizer, audio_tokenizer, config)
+    # Zero-shot cloning requires a reference audio
+    ref_audio = getattr(config, "default_ref_audio", None)
+    if not ref_audio or not Path(str(ref_audio)).exists():
+        logger.error("default_ref_audio missing or not found; cannot run infer without reference audio")
+        return None
+    
+    wav = generate_speech_clone(text, str(ref_audio), model, tokenizer, audio_tokenizer, config)
     
     if wav.size > 0:
         save_audio(wav, "generated_speech.wav", config.sample_rate)

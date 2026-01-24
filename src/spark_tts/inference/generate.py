@@ -1,15 +1,16 @@
-"""Inference utilities for Spark-TTS."""
+"""Inference utilities for Spark-TTS (zero-shot voice cloning)."""
 
 import logging
 import re
-from pathlib import Path
 import torch
 import numpy as np
-from unsloth import FastModel
+import soundfile as sf
 from transformers.generation.logits_process import LogitsProcessor
+import librosa
 
 from ..config import Config
 from ..data.tokenizer import AudioTokenizer
+from ..text_processor import normalize_text, IndicLanguageDetector
 
 logger = logging.getLogger("spark_tts")
 
@@ -22,16 +23,6 @@ SEMANTIC_CODEBOOK_SIZE = 8192
 
 # During cloning we don't want to stop immediately.
 MIN_NEW_SEMANTIC_TOKENS = 200
-
-
-def _get_eos_token_id(tokenizer) -> int:
-    """Get the appropriate EOS token ID for generation."""
-    for token in STOP_TOKENS:
-        token_id = tokenizer.convert_tokens_to_ids(token)
-        if token_id != tokenizer.unk_token_id:
-            return token_id
-    # Fallback to default EOS
-    return tokenizer.eos_token_id
 
 
 def _safe_token_id(tokenizer, token: str) -> int | None:
@@ -123,178 +114,6 @@ def _extract_codec_ids(kind: str, token_strs: list[str]) -> list[int]:
     return out
 
 
-@torch.inference_mode()
-def _generate_text(
-    model,
-    model_inputs,
-    tokenizer,
-    config: Config,
-    *,
-    do_sample: bool,
-    temperature: float,
-    top_k: int,
-    top_p: float,
-    repetition_penalty: float | None = None,
-) -> str:
-    eos_token_id = _get_eos_token_id(tokenizer)
-    gen_kwargs = {}
-    if repetition_penalty is not None:
-        gen_kwargs["repetition_penalty"] = float(repetition_penalty)
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=config.max_new_audio_tokens,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        eos_token_id=eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        **gen_kwargs,
-    )
-    generated_ids_trimmed = generated_ids[:, model_inputs.input_ids.shape[1] :]
-    return tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=False)[0]
-
-
-@torch.inference_mode()
-def generate_speech(
-    text: str,
-    model,
-    tokenizer,
-    audio_tokenizer: AudioTokenizer,
-    config: Config,
-) -> np.ndarray:
-    """
-    Generate speech audio from text.
-
-    Args:
-        text: Input text to convert to speech
-        model: Trained model
-        tokenizer: Text tokenizer
-        audio_tokenizer: Audio tokenizer for detokenization
-        config: Configuration with inference settings
-
-    Returns:
-        Generated waveform as numpy array
-    """
-    torch.compiler.reset()
-
-    # If the model was trained for cloning (semantic-only objective), plain generation without a
-    # reference speaker is not supported. Fall back to clone-conditioned inference using the
-    # default reference audio when available.
-    obj = str(getattr(config, "train_objective", "")).lower()
-    if obj in {"clone_semantic", "clone_semantic_v1"}:
-        ref = getattr(config, "default_ref_audio", None)
-        if ref and Path(str(ref)).exists():
-            logger.info("train_objective=%s; using clone-conditioned inference with default_ref_audio=%s", obj, ref)
-            return generate_speech_clone(str(text), str(ref), model, tokenizer, audio_tokenizer, config)
-        logger.error("train_objective=%s but no reference audio found (default_ref_audio=%s)", obj, ref)
-        return np.array([], dtype=np.float32)
-
-    # Prepare prompt (no speaker prefix - identity comes from global tokens)
-    prompt = "".join([
-        "<|task_tts|>",
-        "<|start_content|>",
-        text,
-        "<|end_content|>",
-        "<|start_global_token|>",
-    ])
-
-    REQUIRED_GLOBAL_TOKENS = 32
-
-    # Constrained decoding: prevent random non-codec tokens during audio token generation.
-    global_vocab_ids, semantic_vocab_ids = _build_codec_token_id_lists(tokenizer)
-    stop_token_ids = _get_stop_token_ids(tokenizer)
-
-    rep_pen = getattr(config, "repetition_penalty", None)
-    gen_kwargs = {}
-    if rep_pen is not None:
-        gen_kwargs["repetition_penalty"] = float(rep_pen)
-
-    # 1) Generate exactly 32 GLOBAL tokens (codec-only)
-    model_inputs_g = tokenizer([prompt], return_tensors="pt").to(config.device)
-    global_processor = _AllowTokenIDsProcessor(global_vocab_ids)
-    out_g = model.generate(
-        **model_inputs_g,
-        max_new_tokens=REQUIRED_GLOBAL_TOKENS,
-        do_sample=True,
-        temperature=config.temperature,
-        top_k=config.top_k,
-        top_p=config.top_p,
-        eos_token_id=stop_token_ids,  # safe; stop tokens are masked out here anyway
-        pad_token_id=tokenizer.pad_token_id,
-        logits_processor=[global_processor],
-        **gen_kwargs,
-    )
-    gen_global_ids = out_g[:, model_inputs_g.input_ids.shape[1] :]
-    gen_global_tokens = tokenizer.convert_ids_to_tokens(gen_global_ids[0].tolist(), skip_special_tokens=False)
-    global_ids = _extract_codec_ids("global", gen_global_tokens)
-
-    # 2) Generate SEMANTIC tokens (codec-only + stop tokens), conditioned on globals
-    globals_str = "".join(f"<|bicodec_global_{i}|>" for i in global_ids)
-    prompt_sem = "".join([
-        prompt,
-        globals_str,
-        "<|end_global_token|>",
-        "<|start_semantic_token|>",
-    ])
-
-    model_inputs_s = tokenizer([prompt_sem], return_tensors="pt").to(config.device)
-    semantic_processor = _AllowTokenIDsProcessor(semantic_vocab_ids + stop_token_ids)
-    out_s = model.generate(
-        **model_inputs_s,
-        max_new_tokens=config.max_new_audio_tokens,
-        do_sample=True,
-        temperature=config.temperature,
-        top_k=config.top_k,
-        top_p=config.top_p,
-        eos_token_id=stop_token_ids,
-        pad_token_id=tokenizer.pad_token_id,
-        logits_processor=[semantic_processor],
-        **gen_kwargs,
-    )
-    gen_sem_ids = out_s[:, model_inputs_s.input_ids.shape[1] :]
-    gen_sem_tokens = tokenizer.convert_ids_to_tokens(gen_sem_ids[0].tolist(), skip_special_tokens=False)
-    semantic_ids = _extract_codec_ids("semantic", gen_sem_tokens)
-
-    logger.info(
-        "Constrained generation | global=%d | semantic=%d | first_sem_tokens=%s",
-        len(global_ids),
-        len(semantic_ids),
-        semantic_ids[:8],
-    )
-
-    if not semantic_ids:
-        logger.warning("No semantic tokens found even with constrained decoding.")
-        return np.array([], dtype=np.float32)
-
-    pred_semantic_ids = torch.tensor(semantic_ids).long().unsqueeze(0)
-
-    # Ensure global tokens are exactly 32 for speaker encoder
-    if not global_ids:
-        logger.warning("No global tokens generated; padding with zeros")
-        pred_global_ids = torch.zeros((1, REQUIRED_GLOBAL_TOKENS), dtype=torch.long)
-    else:
-        if len(global_ids) < REQUIRED_GLOBAL_TOKENS:
-            logger.warning("Only %d global tokens, padding to %d", len(global_ids), REQUIRED_GLOBAL_TOKENS)
-            global_ids = global_ids + [0] * (REQUIRED_GLOBAL_TOKENS - len(global_ids))
-        elif len(global_ids) > REQUIRED_GLOBAL_TOKENS:
-            global_ids = global_ids[:REQUIRED_GLOBAL_TOKENS]
-        pred_global_ids = torch.tensor(global_ids).long().unsqueeze(0)
-
-    pred_global_ids = pred_global_ids.unsqueeze(0)
-
-    logger.info(f"Semantic tokens: {pred_semantic_ids.shape[1]}, Global tokens: {pred_global_ids.shape[2]}")
-
-    # Detokenize to audio
-    audio_tokenizer.to(str(config.device))
-    wav_np = audio_tokenizer.detokenize(
-        pred_global_ids.to(config.device).squeeze(0),
-        pred_semantic_ids.to(config.device),
-    )
-
-    return wav_np
-
-
 def _wav_seems_silent(wav: np.ndarray, eps: float = 1e-4) -> bool:
     if wav is None or wav.size == 0:
         return True
@@ -348,7 +167,6 @@ def prepare_wav_for_save(wav: np.ndarray, sample_rate: int = 16000) -> np.ndarra
 
 def save_audio(wav: np.ndarray, path: str, sample_rate: int = 16000):
     """Save waveform to file."""
-    import soundfile as sf
     wav = prepare_wav_for_save(wav, sample_rate)
     sf.write(path, wav, sample_rate, subtype="PCM_16")
     logger.info("Audio saved to %s (%.2fs)", path, float(wav.shape[0]) / float(sample_rate) if wav.size else 0.0)
@@ -379,10 +197,14 @@ def generate_speech_clone(
 
     Returns:
         Generated waveform as numpy array
-    """
-    import librosa
+    """ 
     
     torch.compiler.reset()
+
+    # Normalize text (acronyms, currency, numbers -> words)
+    lang = IndicLanguageDetector.detect_script(text)
+    text = normalize_text(text, lang=lang)
+    logger.info(f"Normalized text (lang={lang}): {text[:100]}...")
 
     # Load and tokenize reference audio to extract speaker identity
     ref_audio, ref_sr = librosa.load(ref_audio_path, sr=None)

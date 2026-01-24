@@ -122,14 +122,14 @@ class Config:
     # Dataset language codes are inferred from folder layout: datasets/<lang>/...
     # These defaults cover a typical 10-language Indic setup.
     indic_languages: list[str] = field(
-        default_factory=lambda: ["hi", "kn", "ta", "bh", "mr", "mai", "mag", "gu", "bn", "hne"]
+        default_factory=lambda: ["hi", "kn", "te", "bh", "mr", "mai", "mag", "gu", "bn", "hne"]
     )
     base_languages: list[str] = field(default_factory=list)
 
     # Stage language filters:
     # - None means "use whatever languages exist in the dataset root".
     stage1_languages: list[str] | None = field(
-        default_factory=lambda: ["hi", "kn", "ta", "bh", "mr", "mai", "mag", "gu", "bn", "hne"]
+        default_factory=lambda: ["hi", "kn", "te", "bh", "mr", "mai", "mag", "gu", "bn", "hne"]
     )
     stage2_languages: list[str] | None = None
 

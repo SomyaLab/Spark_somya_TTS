@@ -22,6 +22,9 @@ dependencies = [
     "tqdm>=4.67.1",
     "sentencepiece>=0.2.1",
     "tensorboard>=2.20.0",
+    "uvicorn>=0.40.0",
+    "fastapi>=0.128.0",
+    "python-multipart>=0.0.21",
 ]
 
 [build-system]

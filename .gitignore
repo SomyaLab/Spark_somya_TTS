@@ -26,6 +26,8 @@ unsloth*/
 # Data
 data/
 dataset/
+datasets/
+client_outputs/
 .cache/
 
 # External dependencies

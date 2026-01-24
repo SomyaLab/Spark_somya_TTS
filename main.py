@@ -24,12 +24,11 @@ from src.spark_tts.inference.generate import generate_speech, generate_speech_cl
 
 logger = logging.getLogger("spark_tts")
 
-
 def run_inference(text: str | None, config: Config):
     """Generate speech from text."""
     setup_logging()
     
-    default_text = "'ಮಹಾಭಾರತ' ಒಂದು ಮಹತ್ತರ ಕೃತಿ ಆಗಿದ್ದು, ಅದು ಭಾರತೀಯ ಜೀವನ, ಚಿಂತನೆ, ತತ್ತ್ವಶಾಸ್ತ್ರ ಹಾಗೂ ವರ್ತನೆಯನ್ನು ಸ್ಪಷ್ಟ ರೂಪದಲ್ಲಿ ಪ್ರದರ್ಶಿಸುತ್ತದೆ."
+    default_text = "सीरिकल्चर रिसर्च अपने छोट आकार आउर संस्कृति में आसानी के कारण आदर्श जीव बन गइल बा"
     
     if not text:
         logger.info(f"No input text provided. Using default:\n{default_text}")
@@ -40,8 +39,9 @@ def run_inference(text: str | None, config: Config):
             model_name=config.lora_dir,
             max_seq_length=config.max_seq_length,
             dtype=config.dtype,
+            full_finetuning=getattr(config, "full_finetuning", False),
             load_in_4bit=config.load_in_4bit,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
     else:
         model, tokenizer = load_model(config)
@@ -49,12 +49,21 @@ def run_inference(text: str | None, config: Config):
     FastModel.for_inference(model)
     audio_tokenizer = AudioTokenizer(config.model_dir, str(config.device))
     
-    # Prefer conditioning on a reference speaker (more reliable than generating global tokens from scratch).
+    # Clone-conditioned inference is the default for this repo.
     wav = None
-    if getattr(config, "default_ref_audio", None) and Path(str(config.default_ref_audio)).exists():
-        wav = generate_speech_clone(text, str(config.default_ref_audio), model, tokenizer, audio_tokenizer, config)
+    obj = str(getattr(config, "train_objective", "")).lower()
+    if obj in {"clone_semantic", "clone_semantic_v1"}:
+        if getattr(config, "default_ref_audio", None) and Path(str(config.default_ref_audio)).exists():
+            wav = generate_speech_clone(text, str(config.default_ref_audio), model, tokenizer, audio_tokenizer, config)
+        else:
+            logger.error("train_objective=%s but default_ref_audio missing; cannot run infer", obj)
+            return None
     else:
-        wav = generate_speech(text, model, tokenizer, audio_tokenizer, config)
+        # Legacy fallback: allow plain generation if objective supports it.
+        if getattr(config, "default_ref_audio", None) and Path(str(config.default_ref_audio)).exists():
+            wav = generate_speech_clone(text, str(config.default_ref_audio), model, tokenizer, audio_tokenizer, config)
+        else:
+            wav = generate_speech(text, model, tokenizer, audio_tokenizer, config)
     
     if wav.size > 0:
         save_audio(wav, "generated_speech.wav", config.sample_rate)
@@ -91,8 +100,9 @@ def run_clone(text: str | None = None, ref_audio: str | None = None, config: Con
             model_name=config.lora_dir,
             max_seq_length=config.max_seq_length,
             dtype=config.dtype,
+            full_finetuning=getattr(config, "full_finetuning", False),
             load_in_4bit=config.load_in_4bit,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
     else:
         model, tokenizer = load_model(config)
@@ -138,13 +148,17 @@ def main():
 
     elif cmd == "infer":
         text = args[1] if len(args) > 1 else None
-        run_inference(text, config)
+        out_path = run_inference(text, config)
+        if out_path:
+            print(str(Path(out_path).resolve()))
 
     elif cmd == "clone":
         # Accept defaults if not enough args
         text = args[1] if len(args) > 1 else None
         ref_audio = args[2] if len(args) > 2 else None
-        run_clone(text, ref_audio, config)
+        out_path = run_clone(text, ref_audio, config)
+        if out_path:
+            print(str(Path(out_path).resolve()))
 
     else:
         print(f"Unknown command: {cmd}")

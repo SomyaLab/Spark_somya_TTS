@@ -3,11 +3,12 @@
 import logging
 import torch
 from pathlib import Path
+from dataclasses import replace
 from huggingface_hub import snapshot_download
 from unsloth import FastModel
 from trl import SFTConfig, SFTTrainer
 from datasets import Dataset
-from transformers import TrainerCallback, AutoTokenizer
+from transformers import AutoTokenizer
 
 from ..config import Config
 from ..data.tokenizer import AudioTokenizer
@@ -15,73 +16,13 @@ from ..data.dataset import load_local_dataset
 
 logger = logging.getLogger("spark_tts")
 
-
-class NormalizedLossCallback(TrainerCallback):
-    """Log normalized loss (loss / gradient_accumulation_steps) for easier reading."""
-    
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs and "loss" in logs:
-            ga_steps = args.gradient_accumulation_steps
-            raw_loss = logs["loss"]
-            normalized_loss = raw_loss / ga_steps
-            logs["loss_normalized"] = normalized_loss
-
-
-class PrettyLogsCallback(TrainerCallback):
-    """Concise, readable console logs (doesn't affect training)."""
-    
-    def __init__(self, every_n_steps: int = 10):
-        self.every_n_steps = max(int(every_n_steps), 0)
-    
-    def _should_print(self, state) -> bool:
-        if self.every_n_steps <= 0:
-            return False
-        # Print at step 1 and then every N steps to avoid spamming
-        return state.global_step == 1 or (state.global_step % self.every_n_steps == 0)
-    
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if not logs or not self._should_print(state):
-            return
-        # HF typically provides: loss, learning_rate, grad_norm, epoch, step, etc.
-        loss = logs.get("loss")
-        loss_norm = logs.get("loss_normalized")
-        lr = logs.get("learning_rate")
-        grad_norm = logs.get("grad_norm")
-        
-        parts = [f"step={state.global_step}"]
-        if loss is not None:
-            if loss_norm is not None:
-                parts.append(f"loss={loss:.4f} (norm={loss_norm:.4f})")
-            else:
-                parts.append(f"loss={loss:.4f}")
-        if lr is not None:
-            parts.append(f"lr={lr:.2e}")
-        if grad_norm is not None:
-            parts.append(f"grad_norm={grad_norm:.2f}")
-        
-        logger.info(" | ".join(parts))
-    
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if not metrics:
-            return
-        eval_loss = metrics.get("eval_loss")
-        if eval_loss is None:
-            return
-        msg = f"eval | step={state.global_step} | eval_loss={eval_loss:.4f}"
-        if getattr(state, "best_metric", None) is not None:
-            # best_metric corresponds to metric_for_best_model
-            msg += f" | best={state.best_metric:.4f}"
-        if getattr(state, "best_model_checkpoint", None):
-            msg += f" | best_ckpt={Path(state.best_model_checkpoint).name}"
-        logger.info(msg)
-
-
 def setup_logging(level: str = "INFO"):
     """Configure logging once at startup."""
     logging.basicConfig(
         level=getattr(logging, level),
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
+        force=True,  # Unsloth/Transformers may pre-configure handlers; ensure our logs show up.
     )
 
 
@@ -238,6 +179,7 @@ def _build_sft_config(config: Config, output_dir: str, max_steps: int, lr: float
         # If anything goes wrong, fall back to provided LR.
         effective_lr = lr
 
+    use_bf16 = bool(getattr(config, "dtype", None) == torch.bfloat16)
     return SFTConfig(
         per_device_train_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -255,9 +197,9 @@ def _build_sft_config(config: Config, output_dir: str, max_steps: int, lr: float
         max_grad_norm=config.max_grad_norm,
         label_smoothing_factor=config.label_smoothing,
         fp16=False,
-        bf16=True,
+        bf16=use_bf16,
         logging_dir=f"{output_dir}/logs",
-        report_to="tensorboard",
+        report_to="none",
         eval_strategy=overrides.get("eval_strategy", config.evaluation_strategy),
         eval_steps=overrides.get("eval_steps", config.eval_steps),
         load_best_model_at_end=overrides.get("load_best_model_at_end", config.load_best_model_at_end),
@@ -295,10 +237,6 @@ def _create_trainer(
         eval_dataset=eval_dataset,
         packing=False,
         args=sft_config,
-        callbacks=[
-            NormalizedLossCallback(),
-            PrettyLogsCallback(every_n_steps=config.pretty_log_steps),
-        ],
     )
 
 
@@ -337,9 +275,20 @@ def load_model(config: Config) -> tuple:
             logger.info(f"Loading extended model from {config.extended_model_dir}")
             model_path = config.extended_model_dir
         else:
-            logger.info(f"Downloading model {config.model_name} to {config.model_dir}")
-            snapshot_download(config.model_name, local_dir=config.model_dir)
+            # Prefer an already-downloaded local base model if present.
             model_path = f"{config.model_dir}/LLM"
+            if not Path(model_path).exists():
+                # Optional local fallback to avoid lengthy downloads in environments where a
+                # compatible model is already available on disk.
+                fallback_dir = Path("finetuned_tokenize_bench")
+                looks_like_model = fallback_dir.exists() and (fallback_dir / "config.json").exists()
+                if config.model_name == "unsloth/Spark-TTS-0.5B" and looks_like_model:
+                    logger.info(f"Using local model fallback at {fallback_dir} (skipping download)")
+                    model_path = str(fallback_dir)
+                else:
+                    logger.info(f"Downloading model {config.model_name} to {config.model_dir}")
+                    snapshot_download(config.model_name, local_dir=config.model_dir)
+                    model_path = f"{config.model_dir}/LLM"
             
             if not Path(model_path).exists():
                 raise FileNotFoundError(f"Model not found at {model_path}")
@@ -351,7 +300,7 @@ def load_model(config: Config) -> tuple:
             dtype=config.dtype,
             full_finetuning=config.full_finetuning,
             load_in_4bit=config.load_in_4bit,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
         
         logger.info(f"Vocabulary size: {len(tokenizer)}")
@@ -359,6 +308,35 @@ def load_model(config: Config) -> tuple:
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         raise RuntimeError(f"Model loading failed: {e}") from e
+
+
+def load_tokenizer_only(config: Config):
+    """
+    Load just the HF tokenizer (no LLM weights).
+
+    This is used to build the pre-tokenized dataset (input_ids/labels) before loading
+    the large LLM onto GPU, so audio tokenization can run with more free VRAM.
+    """
+    try:
+        if config.use_extended_model and Path(config.extended_model_dir).exists():
+            tok_path = config.extended_model_dir
+        else:
+            tok_path = f"{config.model_dir}/LLM"
+            if not Path(tok_path).exists():
+                # Mirror load_model() fallback
+                fallback_dir = Path("finetuned_tokenize_bench")
+                looks_like_model = fallback_dir.exists() and (fallback_dir / "tokenizer.json").exists()
+                if config.model_name == "unsloth/Spark-TTS-0.5B" and looks_like_model:
+                    tok_path = str(fallback_dir)
+                else:
+                    snapshot_download(config.model_name, local_dir=config.model_dir)
+                    tok_path = f"{config.model_dir}/LLM"
+        tok = AutoTokenizer.from_pretrained(str(tok_path))
+        logger.info(f"Loaded tokenizer only from {tok_path} | vocab={len(tok)}")
+        return tok
+    except Exception as e:
+        logger.error(f"Failed to load tokenizer-only: {e}")
+        raise RuntimeError(f"Tokenizer-only load failed: {e}") from e
 
 
 def setup_lora(model, config: Config):
@@ -414,6 +392,9 @@ def train(
     dataset: Dataset,
     config: Config,
     eval_dataset: Dataset | None = None,
+    *,
+    phase1_dataset: Dataset | None = None,
+    phase2_dataset: Dataset | None = None,
 ) -> dict:
     """Two-phase training pipeline with auto-resume.
     
@@ -482,7 +463,7 @@ def train(
         trainer = _create_trainer(
             model,
             tokenizer,
-            dataset,
+            (phase1_dataset if phase1_dataset is not None else dataset),
             config,
             phase1_config,
             eval_dataset=(eval_dataset if (config.eval_during_phase1 and eval_dataset is not None and config.do_eval) else None),
@@ -520,7 +501,7 @@ def train(
     trainer = _create_trainer(
         model,
         tokenizer,
-        dataset,
+        (phase2_dataset if phase2_dataset is not None else dataset),
         config,
         phase2_config,
         eval_dataset=(eval_dataset if (eval_dataset is not None and config.do_eval) else None),
@@ -542,55 +523,138 @@ def train(
 def run_training(config: Config) -> dict:
     """Complete training pipeline - load, setup, train, save."""
     setup_logging()
-    
-    logger.info("Loading model...")
-    model, tokenizer = load_model(config)
-    model = setup_lora(model, config)
-    
-    logger.info(f"Loading dataset from {config.data_dir}")
-    audio_tokenizer = AudioTokenizer(config.model_dir, str(config.device))
-    dataset = load_local_dataset(
-        config.data_dir,
+
+    # If user requested a small sample_limit, run a short smoke test by default.
+    # This keeps `python main.py train --limit 100` usable for verification.
+    run_cfg = config
+    try:
+        is_mini = (config.sample_limit is not None) and (int(config.sample_limit) > 0)
+    except Exception:
+        is_mini = False
+    if is_mini:
+        run_cfg = replace(
+            config,
+            do_eval=False,
+            val_split=0.0,
+            evaluation_strategy="no",
+            load_best_model_at_end=False,
+            max_steps=min(int(getattr(config, "max_steps", 60)), 60),
+            warmup_steps=min(int(getattr(config, "warmup_steps", 5)), 5),
+            save_steps=min(int(getattr(config, "save_steps", 50)), 50),
+            embedding_warmup_steps=min(int(getattr(config, "embedding_warmup_steps", 20)), 20),
+        )
+        logger.info(
+            "Mini-run mode enabled (sample_limit=%s) | max_steps=%s | embedding_warmup_steps=%s",
+            getattr(config, "sample_limit", None),
+            run_cfg.max_steps,
+            run_cfg.embedding_warmup_steps,
+        )
+
+    # 1) Build dataset first (tokenization is the long pole).
+    #    Load only the HF tokenizer, not the full LLM weights.
+    logger.info(f"Preparing dataset from {run_cfg.data_dir} (LLM not loaded yet)...")
+    tokenizer = load_tokenizer_only(run_cfg)
+    audio_tokenizer = AudioTokenizer(run_cfg.model_dir, str(run_cfg.device))
+    dataset_stage1 = None
+    dataset_stage2 = None
+
+    if getattr(run_cfg, "two_stage", False):
+        logger.info("Building Stage 1 dataset (Indic warmup subset)...")
+        try:
+            dataset_stage1 = load_local_dataset(
+                run_cfg.data_dir,
+                audio_tokenizer,
+                tokenizer=tokenizer,  # For pre-tokenization with loss masking
+                min_duration=run_cfg.min_audio_duration,
+                max_duration=run_cfg.max_audio_duration,
+                max_seq_length=run_cfg.max_seq_length,
+                model_dir=run_cfg.model_dir,
+                sample_rate=run_cfg.sample_rate,
+                use_cloning_pairs=run_cfg.use_cloning_pairs,
+                train_objective=getattr(run_cfg, "train_objective", "clone_semantic"),
+                clone_cross_prob=float(getattr(run_cfg, "clone_cross_prob", 0.8)),
+                sample_limit=run_cfg.sample_limit,
+                languages=getattr(run_cfg, "stage1_languages", None),
+                language_sampling="proportional",
+                base_languages=getattr(run_cfg, "base_languages", None),
+                max_base_fraction=float(getattr(run_cfg, "max_base_fraction", 0.30)),
+                max_samples_per_language=getattr(run_cfg, "max_samples_per_language", None),
+                seed=int(getattr(run_cfg, "seed", 42)),
+                tokenizer_batch_size=run_cfg.tokenizer_batch_size,
+                num_loading_workers=getattr(run_cfg, "num_loading_workers", 4),
+            )
+            logger.info(f"Stage 1 dataset: {len(dataset_stage1)} samples")
+        except Exception as e:
+            dataset_stage1 = None
+            logger.warning(f"Stage 1 dataset build failed; proceeding with Stage 2 only: {e}")
+
+    logger.info("Building Stage 2 dataset (multilingual)...")
+    dataset_stage2 = load_local_dataset(
+        run_cfg.data_dir,
         audio_tokenizer,
         tokenizer=tokenizer,  # For pre-tokenization with loss masking
-        min_duration=config.min_audio_duration,
-        max_duration=config.max_audio_duration,
-        max_seq_length=config.max_seq_length,
-        model_dir=config.model_dir,
-        sample_rate=config.sample_rate,
-        use_cloning_pairs=config.use_cloning_pairs,
-        sample_limit=config.sample_limit,
-        tokenizer_batch_size=config.tokenizer_batch_size,
+        min_duration=run_cfg.min_audio_duration,
+        max_duration=run_cfg.max_audio_duration,
+        max_seq_length=run_cfg.max_seq_length,
+        model_dir=run_cfg.model_dir,
+        sample_rate=run_cfg.sample_rate,
+        use_cloning_pairs=run_cfg.use_cloning_pairs,
+        train_objective=getattr(run_cfg, "train_objective", "clone_semantic"),
+        clone_cross_prob=float(getattr(run_cfg, "clone_cross_prob", 0.8)),
+        sample_limit=run_cfg.sample_limit,
+        languages=getattr(run_cfg, "stage2_languages", None),
+        language_sampling=getattr(run_cfg, "language_sampling", "proportional"),
+        base_languages=getattr(run_cfg, "base_languages", None),
+        max_base_fraction=float(getattr(run_cfg, "max_base_fraction", 0.30)),
+        max_samples_per_language=getattr(run_cfg, "max_samples_per_language", None),
+        seed=int(getattr(run_cfg, "seed", 42)),
+        tokenizer_batch_size=run_cfg.tokenizer_batch_size,
+        num_loading_workers=getattr(run_cfg, "num_loading_workers", 4),
     )
-    logger.info(f"Dataset: {len(dataset)} samples (pre-tokenized with loss masking)")
+    logger.info(f"Stage 2 dataset: {len(dataset_stage2)} samples")
     audio_tokenizer.offload_to_cpu()
+
+    # 2) Now load the LLM and start training.
+    logger.info("Loading model...")
+    model, model_tokenizer = load_model(run_cfg)
+    # Ensure we train with the tokenizer paired with the model (should match vocab).
+    tokenizer = model_tokenizer
+    model = setup_lora(model, run_cfg)
     
-    # Create evaluation split (optional). Best-model selection requires eval.
+    # Create evaluation split (optional) on Stage 2 dataset. Best-model selection requires eval.
     eval_dataset = None
-    train_dataset = dataset
-    if config.do_eval and config.val_split and config.val_split > 0:
+    train_dataset = dataset_stage2
+    if run_cfg.do_eval and run_cfg.val_split and run_cfg.val_split > 0:
         try:
-            n = len(dataset)
+            n = len(dataset_stage2)
             if n >= 2:
                 # Ensure at least 1 sample in eval, but never all samples.
-                val_size = int(round(n * float(config.val_split)))
+                val_size = int(round(n * float(run_cfg.val_split)))
                 val_size = max(1, min(val_size, n - 1))
-                split = dataset.train_test_split(test_size=val_size, seed=config.seed, shuffle=True)
+                split = dataset_stage2.train_test_split(test_size=val_size, seed=run_cfg.seed, shuffle=True)
                 train_dataset = split["train"]
                 eval_dataset = split["test"]
-                logger.info(f"Eval enabled | train={len(train_dataset)} | eval={len(eval_dataset)} | val_split={config.val_split}")
+                logger.info(f"Eval enabled | train={len(train_dataset)} | eval={len(eval_dataset)} | val_split={run_cfg.val_split}")
             else:
                 logger.warning("Eval disabled (dataset too small to split)")
         except Exception as e:
             logger.warning(f"Eval disabled (failed to create split): {e}")
-            train_dataset = dataset
+            train_dataset = dataset_stage2
             eval_dataset = None
     else:
         logger.info("Eval disabled (do_eval=False or val_split<=0)")
     
-    metrics = train(model, tokenizer, train_dataset, config, eval_dataset=eval_dataset)
+    metrics = train(
+        model,
+        tokenizer,
+        train_dataset,
+        run_cfg,
+        eval_dataset=eval_dataset,
+        phase1_dataset=dataset_stage1,
+        phase2_dataset=train_dataset,
+    )
     if metrics.get("best_model_checkpoint"):
         logger.info(f"Best checkpoint: {metrics['best_model_checkpoint']} (best_metric={metrics.get('best_metric')})")
     
-    save_model(model, tokenizer, config)
+    save_model(model, tokenizer, run_cfg)
     return metrics
